@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+PROXY_DIR="${CERGEA_CODEX_PROXY_DIR:-$HOME/.local/share/cergea-codex-proxy}"
+export CODEX_HOME CODEX_PROXY_HOME="${CODEX_PROXY_HOME:-$HOME/.codex-cergea-proxy}"
+if [[ ! -f "$PROXY_DIR/src/cli.ts" ]]; then
+  echo "Proxy source not found at $PROXY_DIR" >&2
+  exit 1
+fi
+exec bun run "$PROXY_DIR/src/cli.ts" stop

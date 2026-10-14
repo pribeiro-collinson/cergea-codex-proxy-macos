@@ -1,0 +1,109 @@
+#!/bin/bash
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+PROXY_DIR="${CERGEA_CODEX_PROXY_DIR:-$HOME/.local/share/cergea-codex-proxy}"
+PROXY_HOME="${CODEX_PROXY_HOME:-$HOME/.codex-cergea-proxy}"
+export CODEX_HOME CODEX_PROXY_HOME="$PROXY_HOME" CERGEA_CODEX_PROXY_DIR="$PROXY_DIR"
+
+# Ensure Bun's runtime HTTPS requests trust the same macOS CA bundle used by
+# installation. The curl preflight alone does not validate Bun's TLS trust.
+CA_BUNDLE="$PROXY_HOME/macos-trust-bundle.pem"
+if [[ ! -s "$CA_BUNDLE" ]]; then
+  echo "macOS CA trust bundle is missing. Rerun: $CODEX_HOME/bin/install-cergea-codex" >&2
+  exit 1
+fi
+export NODE_EXTRA_CA_CERTS="$CA_BUNDLE"
+# Bun documents SSL_CERT_FILE as an additional trusted CA bundle; use its
+# --use-system-ca runtime flag to include macOS trust where supported.
+# Never disable TLS verification.
+export SSL_CERT_FILE="$CA_BUNDLE"
+echo "Bun runtime TLS verification uses the macOS CA bundle and system trust store."
+
+if [[ ! -f "$PROXY_DIR/src/cli.ts" || ! -f "$PROXY_HOME/config.json" ]]; then
+  echo "Cergea proxy is not installed. Run: $CODEX_HOME/bin/install-cergea-codex" >&2
+  exit 1
+fi
+if ! command -v bun >/dev/null 2>&1; then
+  echo "Bun is required. Install it from https://bun.sh/docs/installation" >&2
+  exit 1
+fi
+if pgrep -x ChatGPT >/dev/null 2>&1; then
+  echo "Quit ChatGPT completely before starting the proxy, then run this command again." >&2
+  exit 1
+fi
+
+if [[ -z "${CERGEA_LITELLM_API_KEY:-}" ]]; then
+  read -r -s -p "Cergea LiteLLM API key: " CERGEA_LITELLM_API_KEY
+  printf '\n'
+fi
+if [[ -z "${CERGEA_LITELLM_API_KEY:-}" ]]; then
+  echo "No API key was entered." >&2
+  exit 1
+fi
+export CERGEA_LITELLM_API_KEY
+
+response_file="$(mktemp)"
+curl_config="$(mktemp)"
+chmod 600 "$response_file" "$curl_config"
+trap 'rm -f "$response_file" "$curl_config"' EXIT
+# Keep the bearer token out of curl's process arguments. The mode-600 config is
+# temporary, contains no other secrets, and is removed as soon as preflight ends.
+python3 "$CODEX_HOME/tools/write_preflight_curl_config.py" "$curl_config"
+http_code="$(curl --config "$curl_config" --connect-timeout 10 --max-time 45 -sS -o "$response_file" -w '%{http_code}' || true)"
+if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+  echo "Cergea Chat Completions preflight failed (HTTP ${http_code:-000})." >&2
+  cat "$response_file" >&2
+  exit 1
+fi
+if ! python3 - "$response_file" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        body = json.load(f)
+    assert isinstance(body.get("choices"), list) and body["choices"]
+    assert isinstance(body["choices"][0], dict) and "message" in body["choices"][0]
+except Exception:
+    print("The endpoint returned HTTP success but not a valid Chat Completions response.", file=sys.stderr)
+    with open(sys.argv[1], encoding="utf-8") as f:
+        print(f.read(), file=sys.stderr)
+    sys.exit(1)
+PY
+then
+  echo "Cergea Chat Completions preflight did not return the expected response format." >&2
+  exit 1
+fi
+rm -f "$response_file" "$curl_config"
+trap - EXIT
+
+# Test the exact Bun runtime that will make upstream requests. curl alone can
+# pass while Bun fails certificate validation. The key stays in process env and
+# is not passed in the `bun -e` command line or logged.
+if ! bun --use-system-ca -e '
+const key = Bun.env.CERGEA_LITELLM_API_KEY;
+try {
+  if (!key) throw new Error("API key is unavailable in Bun environment");
+  const response = await fetch("https://litellm.platform.com-eng.cergea.com/v1/models", {
+    headers: { Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`models endpoint returned HTTP ${response.status}`);
+  const body = await response.json();
+  if (!Array.isArray(body?.data)) throw new Error("models endpoint did not return a data array");
+  console.log("Bun runtime TLS/API preflight passed.");
+} catch (error) {
+  console.error(`Bun runtime TLS/API preflight failed: ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+}
+'; then
+  cat >&2 <<EOF
+Bun could not validate or reach the Cergea HTTPS endpoint. The proxy was not started.
+If your organization performs TLS inspection, ask IT for the approved root CA in PEM format,
+then rerun installation with:
+  CERGEA_EXTRA_CA_CERT="/absolute/path/to/company-root.pem" $CODEX_HOME/bin/install-cergea-codex
+EOF
+  exit 1
+fi
+
+echo "Cergea curl and Bun TLS preflights passed. Starting the local Responses API proxy..."
+exec bun --use-system-ca run "$PROXY_DIR/src/cli.ts" start

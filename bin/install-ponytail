@@ -1,0 +1,87 @@
+#!/bin/bash
+set -euo pipefail
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+MARKER="$CODEX_HOME/.cergea-ponytail-installed"
+
+if [[ -f "$MARKER" ]]; then
+  echo "Ponytail was installed by this bundle already. If you removed it from Codex, delete $MARKER and rerun this script."
+  exit 0
+fi
+if ! command -v node >/dev/null 2>&1; then
+  cat >&2 <<EOF
+Node.js was not found on PATH. Ponytail's Codex lifecycle hooks require Node.js.
+Install Node.js (or make `node` available in your non-interactive shell PATH), then rerun:
+  $CODEX_HOME/bin/install-ponytail
+The Cergea proxy itself does not require Node.js.
+EOF
+  exit 2
+fi
+
+# Prefer a normal CLI on PATH. ChatGPT Desktop also bundles a Codex CLI that
+# may be recorded in ~/.codex/config.toml as CODEX_CLI_PATH but not exported to
+# the installer process's PATH; discover and invoke that executable directly.
+resolve_codex_cli() {
+  local candidate=""
+  local config_file="$CODEX_HOME/config.toml"
+
+  if [[ -n "${CODEX_CLI_PATH:-}" && -x "${CODEX_CLI_PATH}" ]]; then
+    printf '%s\n' "$CODEX_CLI_PATH"
+    return 0
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    command -v codex
+    return 0
+  fi
+
+  if [[ -f "$config_file" ]]; then
+    candidate="$(sed -nE 's/^[[:space:]]*CODEX_CLI_PATH[[:space:]]*=[[:space:]]*"([^\"]+)"[[:space:]]*([#].*)?$/\1/p' "$config_file" | head -n 1)"
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  for candidate in \
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex" \
+    "$HOME/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+CODEX_CLI="$(resolve_codex_cli || true)"
+if [[ -z "$CODEX_CLI" ]]; then
+  cat >&2 <<EOF
+Codex CLI was not found on PATH, in $CODEX_HOME/config.toml (CODEX_CLI_PATH), or in the standard ChatGPT Desktop app locations.
+If you have a Codex CLI executable, set CODEX_CLI_PATH to its absolute path and rerun:
+  CODEX_CLI_PATH="/absolute/path/to/codex" $CODEX_HOME/bin/install-ponytail
+EOF
+  exit 2
+fi
+printf 'Using Codex CLI: %s\n' "$CODEX_CLI"
+
+export CODEX_HOME
+# If the marketplace is already configured, the first command may return nonzero.
+# Continue to the plugin install, which is the definitive availability check.
+if ! "$CODEX_CLI" plugin marketplace add DietrichGebert/ponytail; then
+  echo "Marketplace add returned nonzero; continuing in case Ponytail marketplace is already configured." >&2
+fi
+"$CODEX_CLI" plugin add ponytail@ponytail
+mkdir -p "$CODEX_HOME"
+printf 'Installed from DietrichGebert/ponytail on %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "$MARKER"
+chmod 600 "$MARKER"
+cat <<EOF
+
+Ponytail plugin installed. Before using it in a new Codex thread:
+  1. Open Codex and run /hooks.
+  2. Review and trust Ponytail's two lifecycle hooks.
+  3. Start a new thread and use /ponytail lite for a conservative first test.
+
+Ponytail influences coding style/amount of generated code; it does not directly
+compress old tool results already in a conversation. The proxy's history guard
+handles that separate problem.
+EOF

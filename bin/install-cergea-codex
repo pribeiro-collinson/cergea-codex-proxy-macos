@@ -1,0 +1,134 @@
+#!/bin/bash
+set -euo pipefail
+
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+PROXY_DIR="${CERGEA_CODEX_PROXY_DIR:-$HOME/.local/share/cergea-codex-proxy}"
+PROXY_HOME="${CODEX_PROXY_HOME:-$HOME/.codex-cergea-proxy}"
+BUNDLE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CODEX_HOME CODEX_PROXY_HOME="$PROXY_HOME" CERGEA_CODEX_PROXY_DIR="$PROXY_DIR"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "This installer targets macOS." >&2
+  exit 1
+fi
+for command in git bun python3 curl security; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Missing required command: $command" >&2
+    case "$command" in
+      bun) echo "Install Bun from https://bun.sh/docs/installation, then rerun this installer." >&2 ;;
+      git) echo "Install Git/Xcode Command Line Tools, then rerun this installer." >&2 ;;
+      *) ;;
+    esac
+    exit 1
+  fi
+done
+BUN_VERSION="$(bun --version)"
+if ! python3 - "$BUN_VERSION" <<'PYVER'
+import re, sys
+match = re.match(r"^(\d+)\.(\d+)\.(\d+)", sys.argv[1])
+if not match or tuple(map(int, match.groups())) < (1, 3, 0):
+    print(f"Bun 1.3.0 or later is required; found {sys.argv[1]!r}.", file=sys.stderr)
+    raise SystemExit(1)
+PYVER
+then
+  echo "Install a current Bun release from https://bun.sh/docs/installation and retry." >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$PROXY_DIR")" "$PROXY_HOME" "$CODEX_HOME"
+chmod 700 "$PROXY_HOME"
+
+# Pin the only upstream commit this distribution's guarded patchers are tested against.
+# This prevents a moving branch from silently invalidating compatibility patches.
+UPSTREAM_COMMIT="dac2f3e"
+FRESH_CLONE=0
+if [[ ! -d "$PROXY_DIR/.git" ]]; then
+  if [[ -d "$PROXY_DIR" ]] && [[ -z "$(ls -A "$PROXY_DIR" 2>/dev/null)" ]]; then
+    rmdir "$PROXY_DIR"
+  fi
+  if [[ -e "$PROXY_DIR" ]] && [[ -n "$(ls -A "$PROXY_DIR" 2>/dev/null)" ]]; then
+    echo "Proxy directory exists but is not a Git checkout: $PROXY_DIR" >&2
+    echo "Move it aside or set CERGEA_CODEX_PROXY_DIR to a new directory; nothing was overwritten." >&2
+    exit 1
+  fi
+  echo "Downloading the pinned upstream Responses API proxy ($UPSTREAM_COMMIT)..."
+  git clone --depth 1 https://github.com/MakFly/codex-proxy.git "$PROXY_DIR"
+  FRESH_CLONE=1
+else
+  echo "Using existing proxy source at $PROXY_DIR"
+fi
+ACTUAL_COMMIT="$(git -C "$PROXY_DIR" rev-parse --short=7 HEAD)"
+if [[ "$ACTUAL_COMMIT" != "$UPSTREAM_COMMIT" ]]; then
+  if [[ "$FRESH_CLONE" == "1" ]]; then
+    echo "Current branch differs from the tested base; fetching pinned commit $UPSTREAM_COMMIT..."
+    git -C "$PROXY_DIR" fetch --depth=1 origin "$UPSTREAM_COMMIT"
+    git -C "$PROXY_DIR" checkout --detach FETCH_HEAD
+    ACTUAL_COMMIT="$(git -C "$PROXY_DIR" rev-parse --short=7 HEAD)"
+  fi
+  if [[ "$ACTUAL_COMMIT" != "$UPSTREAM_COMMIT" ]]; then
+    echo "Unsupported upstream proxy revision: $ACTUAL_COMMIT (expected $UPSTREAM_COMMIT)." >&2
+    echo "The existing checkout was not reset or overwritten. Set CERGEA_CODEX_PROXY_DIR to a fresh path to install the tested revision." >&2
+    exit 1
+  fi
+fi
+
+# Run hermetic fixture tests before touching upstream files. They use temp dirs and
+# validate fail-closed/idempotent behavior of all local patchers and config writers.
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$BUNDLE_ROOT/tests" -p 'test_*.py' -v
+
+# Build the trusted CA bundle on every install, regardless of dependency state.
+# It is also used by the runtime launcher, because curl preflight and Bun fetch
+# have different TLS trust stores on some managed macOS systems.
+CA_BUNDLE="$PROXY_HOME/macos-trust-bundle.pem"
+"$BUNDLE_ROOT/tools/build_macos_ca_bundle.sh" "$CA_BUNDLE"
+chmod 600 "$CA_BUNDLE"
+
+# Do not disable certificate checks. Use the macOS CA bundle for Bun package downloads.
+if [[ ! -x "$PROXY_DIR/node_modules/.bin/tsc" ]]; then
+  echo "Installing proxy dependencies with macOS CA certificates..."
+  if ! (cd "$PROXY_DIR" && SSL_CERT_FILE="$CA_BUNDLE" bun install --frozen-lockfile --cafile "$CA_BUNDLE"); then
+    echo >&2
+    echo "Dependency installation failed. TLS verification was not disabled." >&2
+    echo "If your company network uses TLS inspection, ask IT for its trusted root CA PEM and retry with a CA bundle that includes it." >&2
+    exit 1
+  fi
+else
+  echo "Proxy dependencies already installed; skipping package downloads."
+fi
+
+# These patches are version-guarded and idempotent. They stop if upstream source
+# no longer matches the expected anchors instead of silently modifying other code.
+python3 "$BUNDLE_ROOT/tools/patch_codex_proxy.py" "$PROXY_DIR/src/adapters/openai-chat.ts"
+python3 "$BUNDLE_ROOT/tools/patch_codex_request_zstd.py" "$PROXY_DIR/src/server.ts"
+python3 "$BUNDLE_ROOT/tools/patch_codex_context_budget.py" "$PROXY_DIR"
+python3 "$BUNDLE_ROOT/tools/patch_codex_history_budget.py" "$PROXY_DIR"
+python3 "$BUNDLE_ROOT/tools/patch_codex_multimodal_routing.py" "$PROXY_DIR"
+python3 "$BUNDLE_ROOT/tools/fix-codex-catalog.py"
+python3 "$BUNDLE_ROOT/tools/prepare_proxy_config.py"
+
+(
+  cd "$PROXY_DIR"
+  bun run typecheck
+  bun test
+)
+
+# Adds only the legacy custom-provider alias needed by old threads. The proxy's
+# start command manages model/openai_base_url/catalog keys while preserving the rest.
+python3 "$BUNDLE_ROOT/tools/prepare_codex_config.py" "$CODEX_HOME/config.toml"
+
+cat <<EOF
+
+Cergea Codex proxy installation checks passed.
+  Proxy source: $PROXY_DIR
+  Proxy config: $PROXY_HOME/config.json
+  Codex config: $CODEX_HOME/config.toml
+
+Next:
+  1. Quit ChatGPT completely.
+  2. Run: $CODEX_HOME/bin/start-cergea-codex
+  3. Enter your Cergea API key when prompted.
+  4. After the proxy starts, reopen ChatGPT and select cergea/zai-glm-5.
+  5. Optional: run $CODEX_HOME/bin/install-ponytail to add Ponytail's compact-coding plugin.
+
+Keep the terminal running while using Codex. The API key is not saved to config.toml.
+EOF
