@@ -1,0 +1,65 @@
+# macOS Finder metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+
+# Python caches, environments, and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+ENV/
+*.egg-info/
+
+# Node.js / Bun dependencies and local package-manager state
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+*.local
+
+# Logs, temporary files, and runtime state
+*.log
+logs/
+tmp/
+temp/
+*.pid
+*.sock
+
+# Build and test output
+build/
+dist/
+coverage/
+test-results/
+playwright-report/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup and patch leftovers
+*.bak
+*.orig
+*.rej
